@@ -165,18 +165,78 @@ class AudioConvHubert(nn.Module):
     
         return x
 
+class AudioBlock(nn.Module):
+    def __init__(self, in_channel=1, out_channel=128):
+        super(AudioBlock, self).__init__()
+        self.in_channel = in_channel
+        self.block1 = nn.Sequential(
+            nn.Conv2d(in_channel, 16, kernel_size=3, stride=(1, 2)),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=(1, 2)),
+            nn.BatchNorm2d(32),
+            nn.ReLU()
+        )
+        self.block1_res = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32), 
+            )
+        self.block2 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, stride=(1, 2), padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=(1, 2), padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1), 
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=2),
+            nn.BatchNorm2d(128),
+            nn.ReLU(), 
+        )
+        self.block2_res = nn.Sequential(
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+        )
+        
+        self.dev_conv =  nn.Sequential(
+            nn.ConvTranspose2d(
+            in_channels=128,  # 输入通道数
+            out_channels=out_channel, # 输出通道数
+            kernel_size=(1, 1) # 卷积核大小
+        ), 
+        nn.BatchNorm2d(out_channel), 
+        nn.ReLU(),
+        )
+    
+    def forward(self, audio_fea):
+        """
+        shape of audio_fea: () 
+        """
+        x = audio_fea 
+        x = self.block1(x)
+        pre_x1 = x 
+        x = nn.ReLU()(self.block1_res(x) + pre_x1) # 跳接 
+        x = self.block2(x)
+        pre_x2 = x 
+        x = nn.ReLU()(self.block2_res(x) + pre_x2)
+        x = self.dev_conv(x)
+        return x 
+
 class Model(nn.Module):
     def __init__(self,n_channels=6, mode='hubert'):
         super(Model, self).__init__()
         self.n_channels = n_channels   #BGR
         # ch = [16, 32, 64, 128, 256]  # if you want to run this model on a mobile device, use this. 
         ch = [32, 64, 128, 256, 512]
-        
+        self.mode = mode
         if mode=='hubert':
             self.audio_model = AudioConvHubert()
         if mode=='wenet':
             self.audio_model = AudioConvWenet()
-            
+        if mode == 'test':
+            self.audio_model = AudioBlock(in_channel=1, out_channel=512)
         self.fuse_conv = nn.Sequential(
             DoubleConvDW(ch[4]*2, ch[4], stride=1),
             DoubleConvDW(ch[4], ch[3], stride=1)
@@ -187,7 +247,7 @@ class Model(nn.Module):
         self.down2 = Down(ch[1], ch[2])
         self.down3 = Down(ch[2], ch[3])
         self.down4 = Down(ch[3], ch[4])
-
+        self.middle = Down(ch[4], ch[4])
         self.up1 = Up(ch[4], ch[3]//2)
         self.up2 = Up(ch[3], ch[2]//2)
         self.up3 = Up(ch[2], ch[1]//2)
@@ -201,8 +261,10 @@ class Model(nn.Module):
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        
+        x5 = self.down4(x4)  # x5 shape (1, 512, 10, 10)
+        if self.mode == 'test':
+            x5 = self.middle(x5) 
+        print(f'x5 shape: {x5.shape}')
         audio_feat  = self.audio_model(audio_feat)
         x5 = torch.cat([x5, audio_feat], axis=1)
         x5 = self.fuse_conv(x5)
@@ -236,7 +298,7 @@ if __name__ == '__main__':
             if hasattr(module, 'reparameterize'):
                 module.reparameterize()
         return model
-    device = torch.device("cuda")
+    device = torch.device("cpu")
     def check_onnx(torch_out, torch_in, audio):
         onnx_model = onnx.load(onnx_path)
         onnx.checker.check_model(onnx_model)
@@ -249,9 +311,9 @@ if __name__ == '__main__':
         np.testing.assert_allclose(torch_out[0].cpu().numpy(), ort_outs[0][0], rtol=1e-03, atol=1e-05)
         print("Exported model has been tested with ONNXRuntime, and the result looks good!")
         
-    net = Model(6).eval().to(device)
+    net = Model(6, 'test').eval().to(device)
     img = torch.zeros([1, 6, 160, 160]).to(device)
-    audio = torch.zeros([1, 16, 32, 32]).to(device)
+    audio = torch.zeros([1, 1, 20, 256]).to(device) #torch.zeros([1, 32, 32, 32]).to(device)
     # net = reparameterize_model(net)
     flops, params = profile(net, (img,audio))
     macs, params = clever_format([flops, params], "%3f")
